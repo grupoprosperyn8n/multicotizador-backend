@@ -40,8 +40,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Instalar Playwright y Chromium
-RUN playwright install chromium && \
-    playwright install-deps chromium
+# Nota: playwright install-deps falla con fuentes obsoletas en Debian 13
+# Instalamos las dependencias manualmente y luego Chromium
+RUN playwright install chromium
 
 # Copiar código
 COPY ejecucion/ ./ejecucion/
