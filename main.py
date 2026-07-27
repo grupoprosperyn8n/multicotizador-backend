@@ -1,5 +1,5 @@
 """
-Backend Multicotizador 123Seguro — Desplegado en Coolify (VPS).
+Backend Multicotizador Triunfo Seguros — Desplegado en Coolify (VPS).
 Versión minimalista: solo endpoints de cotización + scraper con Playwright.
 """
 import os
@@ -86,13 +86,13 @@ def ejecutar_scraping_background(
 
     try:
         sys.path.insert(0, os.path.join(PROJECT_ROOT, "ejecucion"))
-        from scraper_123seguro import scrape_123seguro
+        from scraper_triunfo import scrape_triunfo
     except ImportError as e:
         print(f"❌ [BACKGROUND] Error importando scraper: {e}")
         return
 
     try:
-        resultado = asyncio.run(scrape_123seguro(
+        resultado = asyncio.run(scrape_triunfo(
             marca=marca,
             modelo=modelo,
             version=version,
@@ -176,8 +176,8 @@ def _check_playwright():
         return "not_installed"
 
 
-@app.post("/api/cotizar-123seguro")
-async def cotizar_123seguro(req: CotizarRequest, background_tasks: BackgroundTasks):
+@app.post("/api/cotizar-triunfo")
+async def cotizar_triunfo(req: CotizarRequest, background_tasks: BackgroundTasks):
     id_prospecto = None
 
     if req.cliente_nombre or req.cliente_whatsapp:
