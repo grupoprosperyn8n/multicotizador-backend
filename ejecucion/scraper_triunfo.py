@@ -51,7 +51,12 @@ async def _obtener_cookies_sesion() -> dict:
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+            ],
         )
         ctx = await browser.new_context(
             user_agent=HEADERS_API["User-Agent"],
@@ -61,20 +66,44 @@ async def _obtener_cookies_sesion() -> dict:
         page = await ctx.new_page()
 
         try:
+            print(f"    🌐 Navegando a {URL_COTIZADOR}/?product=car...", flush=True)
             await page.goto(f"{URL_COTIZADOR}/?product=car", timeout=TIMEOUT_NAVEGACION)
+            
+            # Esperar a que la página cargue
             try:
-                await page.wait_for_load_state("networkidle", timeout=15000)
-            except Exception:
-                pass
-            await asyncio.sleep(2)
-
+                await page.wait_for_load_state("networkidle", timeout=20000)
+            except Exception as e:
+                print(f"    ⚠️ Timeout networkidle: {e}", flush=True)
+            
+            # Esperar adicional para que Cloudflare establezca cookies
+            await asyncio.sleep(5)
+            
+            # Verificar URL actual
+            current_url = page.url
+            print(f"    📍 URL actual: {current_url}", flush=True)
+            
+            # Obtener cookies
             cookies = await ctx.cookies()
             cookie_dict = {c["name"]: c["value"] for c in cookies}
-            print(f"    ✅ Cookies obtenidas: {len(cookie_dict)} (cf: {'_cfuvid' in cookie_dict})", flush=True)
+            
+            # Verificar cookies específicas de Cloudflare
+            cf_cookies = [c for c in cookies if c["name"] in ["_cfuvid", "__cflb", "cf_clearance"]]
+            print(f"    ✅ Cookies totales: {len(cookie_dict)}", flush=True)
+            print(f"    ✅ Cookies Cloudflare: {len(cf_cookies)}", flush=True)
+            for c in cf_cookies:
+                print(f"       - {c['name']}: {c['value'][:20]}...", flush=True)
+            
+            if not cookie_dict:
+                print(f"    ⚠️ No se obtuvieron cookies. Verificando si hay challenge...", flush=True)
+                title = await page.title()
+                print(f"    📄 Título de página: {title}", flush=True)
+            
             return cookie_dict
 
         except Exception as e:
             print(f"    ⚠️ Error obteniendo cookies: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
             return {}
         finally:
             await browser.close()
