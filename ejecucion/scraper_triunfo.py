@@ -37,6 +37,48 @@ HEADERS_API = {
     "Referer": "https://cotizador.triunfonet.com.ar/",
 }
 
+# Cookies de sesión (se obtienen via Playwright al inicio)
+_session_cookies = {}
+
+
+async def _obtener_cookies_sesion() -> dict:
+    """
+    Abre la página principal con Playwright para obtener cookies de Cloudflare.
+    Las cookies _cfuvid y __cflb son necesarias para que la API no devuelva 403.
+    """
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        )
+        ctx = await browser.new_context(
+            user_agent=HEADERS_API["User-Agent"],
+            viewport={"width": 1366, "height": 768},
+            locale="es-AR",
+        )
+        page = await ctx.new_page()
+
+        try:
+            await page.goto(f"{URL_COTIZADOR}/?product=car", timeout=TIMEOUT_NAVEGACION)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+            await asyncio.sleep(2)
+
+            cookies = await ctx.cookies()
+            cookie_dict = {c["name"]: c["value"] for c in cookies}
+            print(f"    ✅ Cookies obtenidas: {len(cookie_dict)} (cf: {'_cfuvid' in cookie_dict})", flush=True)
+            return cookie_dict
+
+        except Exception as e:
+            print(f"    ⚠️ Error obteniendo cookies: {e}", flush=True)
+            return {}
+        finally:
+            await browser.close()
+
 
 async def _delay(minimo=0.5, maximo=1.5):
     import random
@@ -45,19 +87,20 @@ async def _delay(minimo=0.5, maximo=1.5):
 
 # ─── API Helpers (sin Playwright) ──────────────────────────────────────────
 
-def api_get_brands() -> list:
+def api_get_brands(cookies: dict = None) -> list:
     """Obtiene todas las marcas de autos."""
     resp = requests.get(
         f"{URL_API}/car-brands",
         params={"filter": FILTER_B64},
         headers=HEADERS_API,
+        cookies=cookies,
         timeout=15,
     )
     resp.raise_for_status()
     return resp.json()
 
 
-def api_get_brand_models(brand_id: str) -> dict:
+def api_get_brand_models(brand_id: str, cookies: dict = None) -> dict:
     """Obtiene los modelos de una marca (con include vehicleModels)."""
     import base64
     model_filter = json.dumps({"include": [{"relation": "vehicleModels"}]})
@@ -66,25 +109,27 @@ def api_get_brand_models(brand_id: str) -> dict:
         f"{URL_API}/car-brands/{brand_id}",
         params={"filter": encoded},
         headers=HEADERS_API,
+        cookies=cookies,
         timeout=15,
     )
     resp.raise_for_status()
     return resp.json()
 
 
-def api_get_versions(model_id: str) -> list:
+def api_get_versions(model_id: str, cookies: dict = None) -> list:
     """Obtiene las versiones de un modelo."""
     resp = requests.get(
         f"{URL_API}/vehicle-models/{model_id}/versions",
         params={"filter": FILTER_B64},
         headers=HEADERS_API,
+        cookies=cookies,
         timeout=15,
     )
     resp.raise_for_status()
     return resp.json()
 
 
-def api_get_cities(query: str, limit: int = 5) -> list:
+def api_get_cities(query: str, limit: int = 5, cookies: dict = None) -> list:
     """Busca ciudades por nombre."""
     import base64
     city_filter = json.dumps({
@@ -96,15 +141,16 @@ def api_get_cities(query: str, limit: int = 5) -> list:
         f"{URL_API}/cities",
         params={"filter": encoded},
         headers=HEADERS_API,
+        cookies=cookies,
         timeout=10,
     )
     resp.raise_for_status()
     return resp.json()
 
 
-def _find_brand(marca: str) -> dict | None:
+def _find_brand(marca: str, cookies: dict = None) -> dict | None:
     """Busca una marca por nombre (fuzzy match)."""
-    brands = api_get_brands()
+    brands = api_get_brands(cookies=cookies)
     marca_upper = marca.upper().strip()
 
     for b in brands:
@@ -162,10 +208,10 @@ def _find_version(versions: list, version: str) -> dict | None:
     return versions[0] if versions else None
 
 
-def _find_city(localidad: str) -> dict | None:
+def _find_city(localidad: str, cookies: dict = None) -> dict | None:
     """Busca una ciudad por nombre."""
     try:
-        cities = api_get_cities(localidad, limit=10)
+        cities = api_get_cities(localidad, limit=10, cookies=cookies)
     except Exception:
         return None
 
@@ -286,10 +332,17 @@ async def scrape_triunfo(
         "anio": anio,
     }
 
+    # ── Paso 0: Obtener cookies de sesión via Playwright ──────────────
+    print("  🔑 Obteniendo cookies de sesión...", flush=True)
+    cookies = await _obtener_cookies_sesion()
+    if not cookies:
+        resultado["error"] = "No se pudieron obtener cookies de sesión"
+        return resultado
+
     # ── Paso 1: Buscar IDs via API ────────────────────────────────────
     print("  📡 Buscando marca en API...", flush=True)
     try:
-        brand_data = _find_brand(marca)
+        brand_data = _find_brand(marca, cookies=cookies)
         if not brand_data:
             resultado["error"] = f"Marca no encontrada: {marca}"
             print(f"    ❌ {resultado['error']}", flush=True)
@@ -303,7 +356,7 @@ async def scrape_triunfo(
 
     print("  📡 Buscando modelo en API...", flush=True)
     try:
-        brand_full = api_get_brand_models(brand_data["id"])
+        brand_full = api_get_brand_models(brand_data["id"], cookies=cookies)
         model_data = _find_model(brand_full, modelo, anio)
         if not model_data:
             resultado["error"] = f"Modelo no encontrado: {modelo} (año {anio})"
@@ -318,7 +371,7 @@ async def scrape_triunfo(
 
     print("  📡 Buscando versiones en API...", flush=True)
     try:
-        versions = api_get_versions(model_data["id"])
+        versions = api_get_versions(model_data["id"], cookies=cookies)
         version_data = _find_version(versions, version)
         if not version_data:
             resultado["error"] = f"Versión no encontrada: {version}"
@@ -331,8 +384,8 @@ async def scrape_triunfo(
         traceback.print_exc()
         return resultado
 
-    print("  📡 Buscando ciudad en API...")
-    city_data = _find_city(localidad)
+    print("  📡 Buscando ciudad en API...", flush=True)
+    city_data = _find_city(localidad, cookies=cookies)
     if not city_data:
         # La Plata (capital de Buenos Aires) es cubierta por Triunfo; CABA no
         print(f"    ⚠️ Ciudad no encontrada: {localidad}, usando La Plata por defecto")
@@ -400,6 +453,7 @@ async def scrape_triunfo(
                 f"{URL_API}/estimates",
                 json=payload,
                 headers=post_headers,
+                cookies=cookies,
                 timeout=30,
             )
             print(f"    📊 Status: {resp.status_code} (ciudad: {attempt_city['name']})")
