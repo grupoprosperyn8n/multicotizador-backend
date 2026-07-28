@@ -29,6 +29,14 @@ RECAPTCHA_SITE_KEY = "6LeXk2YfAAAAAPILVCWT7BWz-UTAmiA4b26Utt5f"
 
 TIMEOUT_NAVEGACION = 60000
 
+HEADERS_API = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "es-AR,es;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Origin": "https://cotizador.triunfonet.com.ar",
+    "Referer": "https://cotizador.triunfonet.com.ar/",
+}
+
 
 async def _delay(minimo=0.5, maximo=1.5):
     import random
@@ -42,6 +50,7 @@ def api_get_brands() -> list:
     resp = requests.get(
         f"{URL_API}/car-brands",
         params={"filter": FILTER_B64},
+        headers=HEADERS_API,
         timeout=15,
     )
     resp.raise_for_status()
@@ -56,6 +65,7 @@ def api_get_brand_models(brand_id: str) -> dict:
     resp = requests.get(
         f"{URL_API}/car-brands/{brand_id}",
         params={"filter": encoded},
+        headers=HEADERS_API,
         timeout=15,
     )
     resp.raise_for_status()
@@ -67,6 +77,7 @@ def api_get_versions(model_id: str) -> list:
     resp = requests.get(
         f"{URL_API}/vehicle-models/{model_id}/versions",
         params={"filter": FILTER_B64},
+        headers=HEADERS_API,
         timeout=15,
     )
     resp.raise_for_status()
@@ -84,6 +95,7 @@ def api_get_cities(query: str, limit: int = 5) -> list:
     resp = requests.get(
         f"{URL_API}/cities",
         params={"filter": encoded},
+        headers=HEADERS_API,
         timeout=10,
     )
     resp.raise_for_status()
@@ -383,10 +395,11 @@ async def scrape_triunfo(
         for attempt_city in cities_to_try:
             payload["cityId"] = attempt_city["id"]
 
+            post_headers = {**HEADERS_API, "Content-Type": "application/json"}
             resp = requests.post(
                 f"{URL_API}/estimates",
                 json=payload,
-                headers={"Content-Type": "application/json"},
+                headers=post_headers,
                 timeout=30,
             )
             print(f"    📊 Status: {resp.status_code} (ciudad: {attempt_city['name']})")
