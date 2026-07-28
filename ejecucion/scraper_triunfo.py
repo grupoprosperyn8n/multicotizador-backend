@@ -1,128 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-Scraper Triunfo Seguros — Cotizador Angular + API REST.
+Scraper Triunfo Seguros — Cotizador Angular via Playwright UI.
 
 ESTRATEGIA:
-- API pública de Triunfo para buscar marca/modelo/version/city (sin UI)
-- Playwright SOLO para obtener token reCAPTCHA desde la página /applicant
-- POST directo a la API con los campos correctos descubiertos
-
-La API NO tiene Cloudflare blocking — funciona directo con requests.
+- Todo el flujo via Playwright (navegador real)
+- Cloudflare bloquea requests directos desde VPS/datacenter IPs
+- Playwright maneja cookies, JavaScript y challenges automáticamente
+- Flujo: navegar → seleccionar marca/modelo/version → llenar form → extraer resultados
 
 Autor: Sistema Agéntico GPY
-Fecha: 2026-07-27
+Fecha: 2026-07-28
 """
 
 import asyncio
 import json
-import os
 import re
 import traceback
-from datetime import datetime
-
-import requests
 
 URL_COTIZADOR = "https://cotizador.triunfonet.com.ar"
-URL_API = "https://api-cotizador.triunfonet.com.ar"
-FILTER_B64 = "eyJvcmRlciI6InBvcHVsYXJpdHkgREVTQyJ9"  # {"order":"popularity DESC"}
-RECAPTCHA_SITE_KEY = "6LeXk2YfAAAAAPILVCWT7BWz-UTAmiA4b26Utt5f"
-
 TIMEOUT_NAVEGACION = 60000
-
-HEADERS_API = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "es-AR,es;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Origin": "https://cotizador.triunfonet.com.ar",
-    "Referer": "https://cotizador.triunfonet.com.ar/",
-}
-
-# Cookies de sesión (se obtienen via Playwright al inicio)
-_session_cookies = {}
-
-
-async def _obtener_cookies_sesion() -> dict:
-    """
-    Abre la página principal con Playwright para obtener cookies de Cloudflare.
-    Las cookies _cfuvid y __cflb son necesarias para que la API no devuelva 403.
-    """
-    from playwright.async_api import async_playwright
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-features=IsolateOrigins,site-per-process",
-                "--disable-site-isolation-trials",
-            ],
-        )
-        ctx = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            viewport={"width": 1920, "height": 1080},
-            locale="es-AR",
-            timezone_id="America/Argentina/Buenos_Aires",
-            geolocation={"latitude": -34.6118, "longitude": -58.3960},
-            permissions=["geolocation"],
-        )
-        page = await ctx.new_page()
-
-        # Anti-detection scripts
-        await page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-            Object.defineProperty(navigator, 'languages', { get: () => ['es-AR', 'es', 'en-US', 'en'] });
-            window.chrome = { runtime: {} };
-            Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-        """)
-
-        try:
-            print(f"    🌐 Navegando a {URL_COTIZADOR}/?product=car...", flush=True)
-            await page.goto(f"{URL_COTIZADOR}/?product=car", timeout=TIMEOUT_NAVEGACION, wait_until="domcontentloaded")
-            
-            # Esperar a que Cloudflare complete el challenge (puede tardar hasta 10 segundos)
-            print(f"    ⏳ Esperando challenge de Cloudflare...", flush=True)
-            await asyncio.sleep(10)
-            
-            # Verificar si pasó el challenge
-            current_url = page.url
-            title = await page.title()
-            print(f"    📍 URL: {current_url}", flush=True)
-            print(f"    📄 Título: {title}", flush=True)
-            
-            # Si todavía está en challenge, esperar más
-            if "momento" in title.lower() or "checking" in title.lower():
-                print(f"    ⏳ Challenge aún activo, esperando 10s más...", flush=True)
-                await asyncio.sleep(10)
-                title = await page.title()
-                print(f"    📄 Título después: {title}", flush=True)
-            
-            # Obtener cookies
-            cookies = await ctx.cookies()
-            cookie_dict = {c["name"]: c["value"] for c in cookies}
-            
-            # Verificar cookies específicas de Cloudflare
-            cf_cookies = [c for c in cookies if c["name"] in ["_cfuvid", "__cflb", "cf_clearance"]]
-            print(f"    ✅ Cookies totales: {len(cookie_dict)}", flush=True)
-            print(f"    ✅ Cookies Cloudflare: {len(cf_cookies)}", flush=True)
-            for c in cf_cookies:
-                print(f"       - {c['name']}: {c['value'][:20]}...", flush=True)
-            
-            if not cookie_dict:
-                print(f"    ⚠️ No se obtuvieron cookies", flush=True)
-            
-            return cookie_dict
-
-        except Exception as e:
-            print(f"    ⚠️ Error obteniendo cookies: {e}", flush=True)
-            import traceback
-            traceback.print_exc()
-            return {}
-        finally:
-            await browser.close()
 
 
 async def _delay(minimo=0.5, maximo=1.5):
@@ -130,220 +26,86 @@ async def _delay(minimo=0.5, maximo=1.5):
     await asyncio.sleep(random.uniform(minimo, maximo))
 
 
-# ─── API Helpers (sin Playwright) ──────────────────────────────────────────
-
-def api_get_brands(cookies: dict = None) -> list:
-    """Obtiene todas las marcas de autos."""
-    resp = requests.get(
-        f"{URL_API}/car-brands",
-        params={"filter": FILTER_B64},
-        headers=HEADERS_API,
-        cookies=cookies,
-        timeout=15,
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def api_get_brand_models(brand_id: str, cookies: dict = None) -> dict:
-    """Obtiene los modelos de una marca (con include vehicleModels)."""
-    import base64
-    model_filter = json.dumps({"include": [{"relation": "vehicleModels"}]})
-    encoded = base64.b64encode(model_filter.encode()).decode()
-    resp = requests.get(
-        f"{URL_API}/car-brands/{brand_id}",
-        params={"filter": encoded},
-        headers=HEADERS_API,
-        cookies=cookies,
-        timeout=15,
-    )
-    resp.raise_for_status()
-    return resp.json()
+async def _click_grid_item(page, texto: str):
+    """Click en un elemento de grilla del modal Angular."""
+    await _delay(1.0, 2.0)
+    result = await page.evaluate("""
+        (texto) => {
+            const all = document.querySelectorAll('.col-12, .col-6, .col-md-6, .col-md-4');
+            for (const el of all) {
+                const t = el.innerText.trim();
+                if (t === texto && el.offsetHeight > 5) {
+                    el.click();
+                    return 'clicked:' + t;
+                }
+            }
+            const allEl = document.querySelectorAll('*');
+            for (const el of allEl) {
+                if (el.innerText && el.innerText.trim() === texto && el.offsetHeight > 5 && el.offsetWidth > 5) {
+                    el.click();
+                    return 'clicked_fallback:' + el.tagName;
+                }
+            }
+            return 'not_found';
+        }
+    """, texto)
+    return result.startswith("clicked")
 
 
-def api_get_versions(model_id: str, cookies: dict = None) -> list:
-    """Obtiene las versiones de un modelo."""
-    resp = requests.get(
-        f"{URL_API}/vehicle-models/{model_id}/versions",
-        params={"filter": FILTER_B64},
-        headers=HEADERS_API,
-        cookies=cookies,
-        timeout=15,
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def api_get_cities(query: str, limit: int = 5, cookies: dict = None) -> list:
-    """Busca ciudades por nombre."""
-    import base64
-    city_filter = json.dumps({
-        "where": {"name": {"like": query.upper()}},
-        "limit": limit,
-    })
-    encoded = base64.b64encode(city_filter.encode()).decode()
-    resp = requests.get(
-        f"{URL_API}/cities",
-        params={"filter": encoded},
-        headers=HEADERS_API,
-        cookies=cookies,
-        timeout=10,
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def _find_brand(marca: str, cookies: dict = None) -> dict | None:
-    """Busca una marca por nombre (fuzzy match)."""
-    brands = api_get_brands(cookies=cookies)
-    marca_upper = marca.upper().strip()
-
-    for b in brands:
-        if b["name"].upper() == marca_upper:
-            return b
-
-    for b in brands:
-        if marca_upper in b["name"].upper() or b["name"].upper() in marca_upper:
-            return b
-
-    return None
-
-
-def _find_model(brand_data: dict, modelo: str, anio: int) -> dict | None:
-    """Busca un modelo por nombre y año dentro de la marca."""
-    models = brand_data.get("vehicleModels", brand_data.get("models", []))
-    modelo_upper = modelo.upper().strip()
-
-    for m in models:
-        name_match = modelo_upper in m.get("name", "").upper() or m.get("name", "").upper() in modelo_upper
-        year_ok = m.get("priceFrom", 0) <= anio <= m.get("priceTo", 9999)
-        if name_match and year_ok:
-            return m
-
-    for m in models:
-        if modelo_upper in m.get("name", "").upper() or m.get("name", "").upper() in modelo_upper:
-            return m
-
-    return None
-
-
-def _find_version(versions: list, version: str) -> dict | None:
-    """Busca una versión por nombre (fuzzy match)."""
-    if not version:
-        return versions[0] if versions else None
-
-    version_upper = version.upper().strip()
-
-    for v in versions:
-        if v.get("name", "").upper() == version_upper:
-            return v
-
-    for v in versions:
-        vname = v.get("name", "").upper()
-        if version_upper in vname or vname in version_upper:
-            return v
-
-    version_words = set(version_upper.split())
-    for v in versions:
-        vname = v.get("name", "").upper()
-        vwords = set(vname.split())
-        if len(version_words & vwords) >= 2:
-            return v
-
-    return versions[0] if versions else None
-
-
-def _find_city(localidad: str, cookies: dict = None) -> dict | None:
-    """Busca una ciudad por nombre."""
+async def _select_brand(page, marca: str):
+    """Selecciona marca en el modal del cotizador."""
+    await page.locator('input[placeholder="Marca"]').first.click()
+    await asyncio.sleep(2)
     try:
-        cities = api_get_cities(localidad, limit=10, cookies=cookies)
+        await page.locator(f'span.brand-name:has-text("{marca}")').first.click(timeout=5000)
+        return True
     except Exception:
-        return None
-
-    if not cities:
-        return None
-
-    localidad_upper = localidad.upper().strip()
-    for c in cities:
-        if localidad_upper in c.get("name", "").upper():
-            return c
-
-    return cities[0] if cities else None
+        pass
+    return await _click_grid_item(page, marca.upper())
 
 
-# ─── reCAPTCHA Token via Playwright ────────────────────────────────────────
+async def _select_year(page, anio: int):
+    """Selecciona año en el modal."""
+    await page.locator('input[placeholder="Año"]').first.click()
+    await asyncio.sleep(2)
+    return await _click_grid_item(page, str(anio))
 
-async def _obtener_token_recaptcha(marca: str, modelo: str, version_id: str, anio: int) -> str | None:
-    """
-    Abre la página /applicant en Playwright y extrae un token reCAPTCHA v3 válido.
-    Solo necesitamos la página para que reCAPTCHA genere el token.
-    """
-    from playwright.async_api import async_playwright
 
-    applicant_url = (
-        f"{URL_COTIZADOR}/applicant"
-        f"?brandName={marca}"
-        f"&yearName={anio}"
-        f"&modelName={modelo}"
-        f"&versionId={version_id}"
-        f"&usage=0"
-    )
+async def _select_model(page, modelo: str):
+    """Selecciona modelo en el modal."""
+    await page.locator('input[placeholder="Modelo"]').first.click()
+    await asyncio.sleep(3)
+    return await _click_grid_item(page, modelo.upper())
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        )
-        context = await browser.new_context(
-            viewport={"width": 1366, "height": 768},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
-            locale="es-AR",
-        )
-        page = await context.new_page()
 
-        try:
-            await page.goto(applicant_url, timeout=TIMEOUT_NAVEGACION)
-            try:
-                await page.wait_for_load_state("networkidle", timeout=20000)
-            except Exception:
-                pass
-            await asyncio.sleep(3)
-
-            token = await page.evaluate("""() => {
-                return new Promise((resolve) => {
-                    try {
-                        if (!window.grecaptcha || !window.grecaptcha.execute) {
-                            resolve(null);
-                            return;
-                        }
-                        window.grecaptcha.ready(function() {
-                            window.grecaptcha.execute('%s', {action: 'submit'}).then(resolve).catch(e => resolve(null));
-                        });
-                    } catch(e) {
-                        resolve(null);
+async def _select_version(page, version_name: str):
+    """Selecciona versión en el modal."""
+    await page.locator('input[placeholder="Version"], input[placeholder="Versión"]').first.click()
+    await asyncio.sleep(3)
+    result = await page.evaluate("""
+        (texto) => {
+            const all = document.querySelectorAll('.col-12, .col-6, .col-md-6');
+            for (const el of all) {
+                const t = el.innerText.trim();
+                if (t.length > 5 && !t.startsWith('Versiones') && el.offsetHeight > 5) {
+                    if (!texto || t.toUpperCase().includes(texto.toUpperCase())) {
+                        el.click();
+                        return 'clicked:' + t;
                     }
-                });
-            }""" % RECAPTCHA_SITE_KEY)
+                }
+            }
+            for (const el of all) {
+                const t = el.innerText.trim();
+                if (t.length > 5 && !t.startsWith('Versiones') && el.offsetHeight > 5) {
+                    el.click();
+                    return 'clicked_first:' + t;
+                }
+            }
+            return 'not_found';
+        }
+    """, version_name)
+    return result.startswith("clicked")
 
-            return token
-
-        except Exception as e:
-            print(f"  ⚠️ Error obteniendo token reCAPTCHA: {e}")
-            return None
-        finally:
-            await browser.close()
-
-
-# ─── Scraping Principal ────────────────────────────────────────────────────
 
 async def scrape_triunfo(
     marca: str,
@@ -355,13 +117,13 @@ async def scrape_triunfo(
     localidad: str = "Capital Federal",
 ) -> dict:
     """
-    Scraping del cotizador de Triunfo Seguros.
+    Scraping del cotizador de Triunfo Seguros via Playwright UI.
 
     Flujo:
-    1. API: buscar marca, modelo, version, city IDs
-    2. Playwright: obtener token reCAPTCHA desde /applicant
-    3. POST directo a API /estimates con los campos correctos
-    4. Parsear respuesta
+    1. Navegar al cotizador
+    2. Seleccionar marca/año/modelo/version via UI
+    3. Llenar formulario de applicant
+    4. Extraer cotizaciones de la página de resultados
 
     Retorna dict con cotizaciones, total, exito, error.
     """
@@ -377,276 +139,200 @@ async def scrape_triunfo(
         "anio": anio,
     }
 
-    # ── Paso 0: Obtener cookies de sesión via Playwright ──────────────
-    print("  🔑 Obteniendo cookies de sesión...", flush=True)
-    cookies = await _obtener_cookies_sesion()
-    if not cookies:
-        resultado["error"] = "No se pudieron obtener cookies de sesión"
-        return resultado
+    from playwright.async_api import async_playwright
 
-    # ── Paso 1: Buscar IDs via API ────────────────────────────────────
-    print("  📡 Buscando marca en API...", flush=True)
-    try:
-        brand_data = _find_brand(marca, cookies=cookies)
-        if not brand_data:
-            resultado["error"] = f"Marca no encontrada: {marca}"
-            print(f"    ❌ {resultado['error']}", flush=True)
-            return resultado
-        print(f"    ✅ Marca: {brand_data['name']} (id={brand_data['id']})", flush=True)
-    except Exception as e:
-        resultado["error"] = f"Error consultando API de marcas: {e}"
-        print(f"    ❌ {resultado['error']}", flush=True)
-        traceback.print_exc()
-        return resultado
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
+        context = await browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            locale="es-AR",
+            timezone_id="America/Argentina/Buenos_Aires",
+        )
+        page = await context.new_page()
 
-    print("  📡 Buscando modelo en API...", flush=True)
-    try:
-        brand_full = api_get_brand_models(brand_data["id"], cookies=cookies)
-        model_data = _find_model(brand_full, modelo, anio)
-        if not model_data:
-            resultado["error"] = f"Modelo no encontrado: {modelo} (año {anio})"
-            print(f"    ❌ {resultado['error']}", flush=True)
-            return resultado
-        print(f"    ✅ Modelo: {model_data['name']} (id={model_data['id']})", flush=True)
-    except Exception as e:
-        resultado["error"] = f"Error consultando API de modelos: {e}"
-        print(f"    ❌ {resultado['error']}", flush=True)
-        traceback.print_exc()
-        return resultado
+        # Anti-detection
+        await page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            window.chrome = { runtime: {} };
+        """)
 
-    print("  📡 Buscando versiones en API...", flush=True)
-    try:
-        versions = api_get_versions(model_data["id"], cookies=cookies)
-        version_data = _find_version(versions, version)
-        if not version_data:
-            resultado["error"] = f"Versión no encontrada: {version}"
-            print(f"    ❌ {resultado['error']}", flush=True)
-            return resultado
-        print(f"    ✅ Versión: {version_data['name']} (id={version_data['id']})", flush=True)
-    except Exception as e:
-        resultado["error"] = f"Error consultando API de versiones: {e}"
-        print(f"    ❌ {resultado['error']}", flush=True)
-        traceback.print_exc()
-        return resultado
+        try:
+            # ── Navegar al cotizador ──────────────────────────────────
+            print("  🌐 Navegando al cotizador...", flush=True)
+            await page.goto(f"{URL_COTIZADOR}/?product=car", timeout=TIMEOUT_NAVEGACION, wait_until="domcontentloaded")
+            
+            # Esperar challenge de Cloudflare
+            print("  ⏳ Esperando Cloudflare...", flush=True)
+            await asyncio.sleep(10)
+            
+            title = await page.title()
+            if "momento" in title.lower() or "checking" in title.lower():
+                print("  ⏳ Challenge activo, esperando más...", flush=True)
+                await asyncio.sleep(15)
+            
+            print(f"  📄 Título: {await page.title()}", flush=True)
 
-    print("  📡 Buscando ciudad en API...", flush=True)
-    city_data = _find_city(localidad, cookies=cookies)
-    if not city_data:
-        # La Plata (capital de Buenos Aires) es cubierta por Triunfo; CABA no
-        print(f"    ⚠️ Ciudad no encontrada: {localidad}, usando La Plata por defecto")
-        city_data = {
-            "id": "5c3cdc39b3728814ddcbfc9a",
-            "name": "Campo la Plata",
-            "zipCode": "7623",
-            "province": "Buenos Aires",
-        }
-    print(f"    ✅ Ciudad: {city_data['name']}, {city_data['province']} (id={city_data['id']})")
+            # ── Seleccionar vehículo via UI ───────────────────────────
+            print(f"  📌 Seleccionando Marca ({marca})...", flush=True)
+            if not await _select_brand(page, marca):
+                resultado["error"] = f"No se pudo seleccionar marca {marca}"
+                return resultado
+            await _delay(1.0, 2.0)
 
-    # Ciudad de respaldo si la principal no está cubierta
-    LA_PLATA_DEFAULT = {
-        "id": "5c3cdc39b3728814ddcbfc9a",
-        "name": "Campo la Plata",
-        "zipCode": "7623",
-        "province": "Buenos Aires",
-    }
+            print(f"  📌 Seleccionando Año ({anio})...", flush=True)
+            if not await _select_year(page, anio):
+                resultado["error"] = f"No se pudo seleccionar año {anio}"
+                return resultado
+            await _delay(1.0, 2.0)
 
-    # ── Paso 2: Obtener token reCAPTCHA ───────────────────────────────
-    print("  🔑 Obteniendo token reCAPTCHA...")
-    token = await _obtener_token_recaptcha(
-        marca=brand_data["name"],
-        modelo=model_data["name"],
-        version_id=version_data["id"],
-        anio=anio,
-    )
-    if not token:
-        resultado["error"] = "No se pudo obtener token reCAPTCHA"
-        return resultado
-    print(f"    ✅ Token reCAPTCHA: {token[:50]}...")
+            print(f"  📌 Seleccionando Modelo ({modelo})...", flush=True)
+            if not await _select_model(page, modelo):
+                resultado["error"] = f"No se pudo seleccionar modelo {modelo}"
+                return resultado
+            await _delay(1.0, 2.0)
 
-    # ── Paso 3: POST a /estimates ─────────────────────────────────────
-    print("  📡 Enviando cotización a API...")
+            print(f"  📌 Seleccionando Versión...", flush=True)
+            if not await _select_version(page, version):
+                resultado["error"] = "No se pudo seleccionar versión"
+                return resultado
+            await _delay(1.0, 2.0)
 
-    phone_code = "11"
-    phone_number = "55551234"
-    phone_full = f"{phone_code}{phone_number}"
+            # ── Click Cotizar ─────────────────────────────────────────
+            print("  📌 Click Cotizar...", flush=True)
+            await page.evaluate("""
+                () => {
+                    const btn = document.getElementById('estimateBtn');
+                    if (btn) { btn.disabled = false; btn.click(); }
+                }
+            """)
+            await asyncio.sleep(5)
 
-    payload = {
-        "captcha": token,
-        "versionId": version_data["id"],
-        "clientEmail": "cotizacion@temp.com",
-        "clientLastName": "Cliente",
-        "clientName": "Cotización",
-        "clientPhoneNumber": phone_full,
-        "cityId": city_data["id"],
-        "year": anio,
-        "zeroKm": False,
-        "vehicleType": "car",
-        "usage": "0",
-    }
+            # ── Verificar que llegamos a /applicant ───────────────────
+            current_url = page.url
+            print(f"  📍 URL actual: {current_url}", flush=True)
 
-    try:
-        # Intentar con la ciudad seleccionada primero, luego La Plata como fallback
-        cities_to_try = [city_data]
-        if city_data.get("id") != LA_PLATA_DEFAULT["id"]:
-            cities_to_try.append(LA_PLATA_DEFAULT)
+            if "/applicant" not in current_url:
+                print("  ⚠️ No se llegó a /applicant", flush=True)
+                resultado["error"] = "No se pudo navegar al formulario"
+                return resultado
 
-        for attempt_city in cities_to_try:
-            payload["cityId"] = attempt_city["id"]
+            # ── Completar formulario de applicant ─────────────────────
+            print("  📝 Completando formulario...", flush=True)
+            
+            try:
+                await page.locator('input[formcontrolname="firstName"]').fill("Juan")
+                await _delay(0.3, 0.6)
+                await page.locator('input[formcontrolname="lastName"]').fill("Perez")
+                await _delay(0.3, 0.6)
+                await page.locator('input[formcontrolname="email"]:visible').fill("cotizacion@temp.com")
+                await _delay(0.3, 0.6)
+                await page.locator('input[formcontrolname="code"]').fill("11")
+                await _delay(0.3, 0.6)
+                await page.locator('input[formcontrolname="cellphone"]').fill("55551234")
+                await _delay(0.3, 0.6)
+                
+                # Localidad
+                await page.locator('input[formcontrolname="finder"]').type(localidad, delay=50)
+                await asyncio.sleep(2)
+                await page.locator('button.dropdown-item:visible').first.click()
+                await _delay(0.5, 1.0)
+            except Exception as e:
+                print(f"  ⚠️ Error llenando form: {e}", flush=True)
 
-            post_headers = {**HEADERS_API, "Content-Type": "application/json"}
-            resp = requests.post(
-                f"{URL_API}/estimates",
-                json=payload,
-                headers=post_headers,
-                cookies=cookies,
-                timeout=30,
-            )
-            print(f"    📊 Status: {resp.status_code} (ciudad: {attempt_city['name']})")
-
-            if resp.status_code == 200:
-                data = resp.json()
-                cotizaciones = _parsear_respuesta_api(data)
-                if cotizaciones:
-                    resultado["cotizaciones"] = cotizaciones
-                    resultado["total_cotizaciones"] = len(cotizaciones)
-                    resultado["exito"] = True
-                    print(f"    ✅ {len(cotizaciones)} cotizaciones obtenidas")
-                    break
-                else:
-                    resultado["error"] = "Respuesta OK pero sin cotizaciones parseables"
-                    resultado["raw_response"] = data
-                    print(f"    ⚠️ Sin cotizaciones: {json.dumps(data, indent=2)[:500]}")
-                    break
+            # ── Click "Ver la cotización" ─────────────────────────────
+            print("  📌 Click 'Ver la cotización'...", flush=True)
+            ver_btn = page.locator('button:has-text("Ver la cotización")').first
+            if await ver_btn.is_visible(timeout=5000):
+                await ver_btn.click()
+                await asyncio.sleep(15)
             else:
-                try:
-                    error_data = resp.json()
-                    error_msg = error_data.get("message", str(error_data))
-                    error_code = error_data.get("errorCode", "")
-                    # Si es error de zona, intentar con La Plata
-                    if "zona" in error_msg.lower() and attempt_city.get("id") != LA_PLATA_DEFAULT["id"]:
-                        print(f"    ⚠️ Zona no cubierta, reintentando con La Plata...")
-                        continue
-                    resultado["error"] = f"API error {resp.status_code}: {error_msg}"
-                    resultado["error_code"] = error_code
-                    resultado["raw_response"] = error_data
-                    print(f"    ❌ Error: {error_msg}")
-                    break
-                except Exception:
-                    resultado["error"] = f"API error {resp.status_code}: {resp.text[:500]}"
-                    print(f"    ❌ Error raw: {resp.text[:500]}")
-                    break
+                print("  ⚠️ Botón no visible", flush=True)
+                resultado["error"] = "Botón de cotización no visible"
+                return resultado
 
-    except requests.Timeout:
-        resultado["error"] = "Timeout al contactar API de Triunfo"
-    except requests.ConnectionError:
-        resultado["error"] = "Error de conexión a API de Triunfo"
-    except Exception as e:
-        resultado["error"] = f"Error inesperado: {e}"
-        traceback.print_exc()
+            # ── Extraer cotizaciones ──────────────────────────────────
+            print("  📊 Extrayendo cotizaciones...", flush=True)
+            text = await page.inner_text("body")
+            cotizaciones = _parsear_resultados(text)
 
-    return resultado
+            if cotizaciones:
+                resultado["cotizaciones"] = cotizaciones
+                resultado["total_cotizaciones"] = len(cotizaciones)
+                resultado["exito"] = True
+                print(f"  ✅ {len(cotizaciones)} cotizaciones obtenidas", flush=True)
+            else:
+                resultado["error"] = "No se encontraron cotizaciones"
+                resultado["texto_debug"] = text[:1500]
+                print(f"  ❌ Sin cotizaciones", flush=True)
+
+            return resultado
+
+        except Exception as e:
+            print(f"  ❌ Error: {e}", flush=True)
+            traceback.print_exc()
+            resultado["error"] = str(e)
+            return resultado
+
+        finally:
+            await browser.close()
 
 
-def _parsear_respuesta_api(data: dict) -> list:
-    """
-    Parsea la respuesta JSON de /estimates en cotizaciones normalizadas.
-    Respuesta exitosa: { id, estimateNumber, quotes: [...] }
-    """
+def _parsear_resultados(text: str) -> list:
+    """Parsea cotizaciones del texto de la página de resultados."""
     cotizaciones = []
 
-    # Direct estimates response with quotes array
-    if isinstance(data, dict) and "quotes" in data:
-        estimate_id = data.get("id", "")
-        estimate_number = data.get("estimateNumber", "")
-        insured_sum = data.get("insuredSum", "")
-        vehicle_type = data.get("vehicleType", "")
-
-        for q in data["quotes"]:
-            if not isinstance(q, dict):
-                continue
-
-            coverage = q.get("coverage", {})
-            payment_desc = q.get("triunfoPaymentDesc", "")
-            monthly_fee = float(q.get("monthlyFee", 0))
-            coverage_name = coverage.get("name", "")
-            coverage_code = coverage.get("coverageNom", q.get("coverageNom", ""))
-
-            extras = coverage.get("extras", [])
-            extra_names = [e.get("name", "") for e in extras if e.get("name")]
-
-            cot = {
-                "aseguradora": "Triunfo Seguros",
-                "plan": coverage_name,
-                "codigo_cobertura": coverage_code,
-                "metodo_pago": payment_desc,
-                "precio_mensual": monthly_fee,
-                "precio_texto": f"${monthly_fee:,.2f}" if monthly_fee > 0 else "",
-                "suma_asegurada": insured_sum,
-                "estimate_id": estimate_id,
-                "estimate_number": estimate_number,
-                "extras": extra_names,
-                "cobertura_detalle": coverage.get("risks", []),
-            }
-
-            cotizaciones.append(cot)
-
-        return cotizaciones
-
-    # Fallback: list of items
-    if isinstance(data, list):
-        items = data
-    elif isinstance(data, dict):
-        items = data.get("estimates", data.get("results", data.get("quotes", [])))
-        if not isinstance(items, list):
-            items = [data]
-    else:
-        return cotizaciones
-
-    for item in items:
-        if not isinstance(item, dict):
+    precios = re.findall(r'\$\s*([\d.,]+)', text)
+    precios_validos = []
+    for p in precios:
+        try:
+            val = float(p.replace('.', '').replace(',', '.'))
+            if 5000 < val < 500000:
+                precios_validos.append({"raw": p, "value": val})
+        except ValueError:
             continue
 
+    if not precios_validos:
+        return cotizaciones
+
+    plan_keywords = [
+        "premium", "básica", "basica", "total", "integral", "contra todo",
+        "responsabilidad civil", "rc", "todo riesgo", "daño propio",
+    ]
+
+    for precio in precios_validos:
         cot = {
             "aseguradora": "Triunfo Seguros",
-            "plan": item.get("planName", item.get("plan", item.get("name", ""))),
-            "precio_mensual": _extract_price(item),
-            "precio_texto": "",
-            "cobertura": item.get("coverage", item.get("description", "")),
-            "detalle": item,
+            "plan": "",
+            "precio_mensual": precio["value"],
+            "precio_texto": f"${precio['raw']}",
+            "texto_completo": "",
         }
 
-        price = cot["precio_mensual"]
-        if price > 0:
-            cot["precio_texto"] = f"${price:,.2f}"
+        precio_idx = text.find(f"${precio['raw']}")
+        if precio_idx > 0:
+            contexto = text[max(0, precio_idx - 200):precio_idx + 200]
+            cot["texto_completo"] = contexto.strip()[:500]
+
+            for kw in plan_keywords:
+                if kw in contexto.lower():
+                    cot["plan"] = kw.title()
+                    break
 
         cotizaciones.append(cot)
 
     return cotizaciones
 
 
-def _extract_price(item: dict) -> float:
-    """Extrae el precio mensual de un item de cotización."""
-    for key in ["monthlyPremium", "monthlyPrice", "premium", "price", "cuota", "totalPremium"]:
-        val = item.get(key)
-        if val is not None:
-            try:
-                return float(val)
-            except (ValueError, TypeError):
-                continue
-
-    if "amounts" in item and isinstance(item["amounts"], dict):
-        for key in ["monthly", "total", "premium"]:
-            val = item["amounts"].get(key)
-            if val is not None:
-                try:
-                    return float(val)
-                except (ValueError, TypeError):
-                    continue
-
-    return 0.0
-
-
-# ── Para testing directo ────────────────────────────────────────────────────
 if __name__ == "__main__":
     import asyncio
 
