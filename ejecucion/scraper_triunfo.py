@@ -262,7 +262,8 @@ async def scrape_triunfo(
 
     Retorna dict con cotizaciones, total, exito, error.
     """
-    print(f"🚗 [TRIUNFO] Cotización: {marca} {modelo} {version} {anio}")
+    print(f"🚗 [TRIUNFO] Cotización: {marca} {modelo} {version} {anio}", flush=True)
+    print(f"  📍 Provincia: {provincia}, Localidad: {localidad}", flush=True)
     resultado = {
         "cotizaciones": [],
         "total_cotizaciones": 0,
@@ -274,39 +275,48 @@ async def scrape_triunfo(
     }
 
     # ── Paso 1: Buscar IDs via API ────────────────────────────────────
-    print("  📡 Buscando marca en API...")
+    print("  📡 Buscando marca en API...", flush=True)
     try:
         brand_data = _find_brand(marca)
         if not brand_data:
             resultado["error"] = f"Marca no encontrada: {marca}"
+            print(f"    ❌ {resultado['error']}", flush=True)
             return resultado
-        print(f"    ✅ Marca: {brand_data['name']} (id={brand_data['id']})")
+        print(f"    ✅ Marca: {brand_data['name']} (id={brand_data['id']})", flush=True)
     except Exception as e:
         resultado["error"] = f"Error consultando API de marcas: {e}"
+        print(f"    ❌ {resultado['error']}", flush=True)
+        traceback.print_exc()
         return resultado
 
-    print("  📡 Buscando modelo en API...")
+    print("  📡 Buscando modelo en API...", flush=True)
     try:
         brand_full = api_get_brand_models(brand_data["id"])
         model_data = _find_model(brand_full, modelo, anio)
         if not model_data:
             resultado["error"] = f"Modelo no encontrado: {modelo} (año {anio})"
+            print(f"    ❌ {resultado['error']}", flush=True)
             return resultado
-        print(f"    ✅ Modelo: {model_data['name']} (id={model_data['id']})")
+        print(f"    ✅ Modelo: {model_data['name']} (id={model_data['id']})", flush=True)
     except Exception as e:
         resultado["error"] = f"Error consultando API de modelos: {e}"
+        print(f"    ❌ {resultado['error']}", flush=True)
+        traceback.print_exc()
         return resultado
 
-    print("  📡 Buscando versiones en API...")
+    print("  📡 Buscando versiones en API...", flush=True)
     try:
         versions = api_get_versions(model_data["id"])
         version_data = _find_version(versions, version)
         if not version_data:
             resultado["error"] = f"Versión no encontrada: {version}"
+            print(f"    ❌ {resultado['error']}", flush=True)
             return resultado
-        print(f"    ✅ Versión: {version_data['name']} (id={version_data['id']})")
+        print(f"    ✅ Versión: {version_data['name']} (id={version_data['id']})", flush=True)
     except Exception as e:
         resultado["error"] = f"Error consultando API de versiones: {e}"
+        print(f"    ❌ {resultado['error']}", flush=True)
+        traceback.print_exc()
         return resultado
 
     print("  📡 Buscando ciudad en API...")
