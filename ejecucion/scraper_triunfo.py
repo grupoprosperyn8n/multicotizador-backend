@@ -142,6 +142,23 @@ async def scrape_triunfo(
     from playwright.async_api import async_playwright
     from playwright_stealth import stealth_async
 
+    # Paso 0: obtener cookies de Cloudflare via cloudscraper
+    print("  🔑 Obteniendo cookies via cloudscraper...", flush=True)
+    cf_cookies = {}
+    try:
+        import cloudscraper
+        scraper_cf = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "mobile": False}
+        )
+        resp = scraper_cf.get(f"{URL_COTIZADOR}/?product=car", timeout=30)
+        print(f"    📊 cloudscraper status: {resp.status_code}", flush=True)
+        cf_cookies = dict(scraper_cf.cookies)
+        print(f"    ✅ Cookies obtenidas: {len(cf_cookies)}", flush=True)
+        for k, v in cf_cookies.items():
+            print(f"       - {k}: {str(v)[:30]}...", flush=True)
+    except Exception as e:
+        print(f"    ⚠️ cloudscraper falló: {e}", flush=True)
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -158,8 +175,21 @@ async def scrape_triunfo(
             locale="es-AR",
             timezone_id="America/Argentina/Buenos_Aires",
         )
-        page = await context.new_page()
 
+        # Inyectar cookies de Cloudflare en el contexto de Playwright
+        if cf_cookies:
+            pw_cookies = []
+            for name, value in cf_cookies.items():
+                pw_cookies.append({
+                    "name": name,
+                    "value": str(value),
+                    "domain": ".triunfonet.com.ar",
+                    "path": "/",
+                })
+            await context.add_cookies(pw_cookies)
+            print(f"    ✅ {len(pw_cookies)} cookies inyectadas en Playwright", flush=True)
+
+        page = await context.new_page()
         await stealth_async(page)
 
         try:
