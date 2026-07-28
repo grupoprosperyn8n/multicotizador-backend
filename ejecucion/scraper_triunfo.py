@@ -140,6 +140,7 @@ async def scrape_triunfo(
     }
 
     from playwright.async_api import async_playwright
+    from playwright_stealth import stealth_async
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -159,12 +160,7 @@ async def scrape_triunfo(
         )
         page = await context.new_page()
 
-        # Anti-detection
-        await page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-            window.chrome = { runtime: {} };
-        """)
+        await stealth_async(page)
 
         try:
             # ── Navegar al cotizador ──────────────────────────────────
