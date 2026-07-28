@@ -56,31 +56,49 @@ async def _obtener_cookies_sesion() -> dict:
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-site-isolation-trials",
             ],
         )
         ctx = await browser.new_context(
-            user_agent=HEADERS_API["User-Agent"],
-            viewport={"width": 1366, "height": 768},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            viewport={"width": 1920, "height": 1080},
             locale="es-AR",
+            timezone_id="America/Argentina/Buenos_Aires",
+            geolocation={"latitude": -34.6118, "longitude": -58.3960},
+            permissions=["geolocation"],
         )
         page = await ctx.new_page()
 
+        # Anti-detection scripts
+        await page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['es-AR', 'es', 'en-US', 'en'] });
+            window.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+        """)
+
         try:
             print(f"    🌐 Navegando a {URL_COTIZADOR}/?product=car...", flush=True)
-            await page.goto(f"{URL_COTIZADOR}/?product=car", timeout=TIMEOUT_NAVEGACION)
+            await page.goto(f"{URL_COTIZADOR}/?product=car", timeout=TIMEOUT_NAVEGACION, wait_until="domcontentloaded")
             
-            # Esperar a que la página cargue
-            try:
-                await page.wait_for_load_state("networkidle", timeout=20000)
-            except Exception as e:
-                print(f"    ⚠️ Timeout networkidle: {e}", flush=True)
+            # Esperar a que Cloudflare complete el challenge (puede tardar hasta 10 segundos)
+            print(f"    ⏳ Esperando challenge de Cloudflare...", flush=True)
+            await asyncio.sleep(10)
             
-            # Esperar adicional para que Cloudflare establezca cookies
-            await asyncio.sleep(5)
-            
-            # Verificar URL actual
+            # Verificar si pasó el challenge
             current_url = page.url
-            print(f"    📍 URL actual: {current_url}", flush=True)
+            title = await page.title()
+            print(f"    📍 URL: {current_url}", flush=True)
+            print(f"    📄 Título: {title}", flush=True)
+            
+            # Si todavía está en challenge, esperar más
+            if "momento" in title.lower() or "checking" in title.lower():
+                print(f"    ⏳ Challenge aún activo, esperando 10s más...", flush=True)
+                await asyncio.sleep(10)
+                title = await page.title()
+                print(f"    📄 Título después: {title}", flush=True)
             
             # Obtener cookies
             cookies = await ctx.cookies()
@@ -94,9 +112,7 @@ async def _obtener_cookies_sesion() -> dict:
                 print(f"       - {c['name']}: {c['value'][:20]}...", flush=True)
             
             if not cookie_dict:
-                print(f"    ⚠️ No se obtuvieron cookies. Verificando si hay challenge...", flush=True)
-                title = await page.title()
-                print(f"    📄 Título de página: {title}", flush=True)
+                print(f"    ⚠️ No se obtuvieron cookies", flush=True)
             
             return cookie_dict
 
